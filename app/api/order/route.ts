@@ -2,12 +2,17 @@ import { NextRequest, NextResponse } from 'next/server';
 import crypto from 'crypto';
 
 const CLOB = 'https://clob.polymarket.com';
+const GAMMA = 'https://gamma-api.polymarket.com';
 const BUILDER_ADDRESS = process.env.BUILDER_ADDRESS || '0xE3244A59c302C99690d1d9354dAD7aa154F4a951';
 const API_KEY = process.env.POLYMARKET_API_KEY || '';
 const SECRET = process.env.POLYMARKET_SECRET || '';
 const PASSPHRASE = process.env.POLYMARKET_PASSPHRASE || '';
 const MAKER_ADDRESS = '0x1d750079d269c19e4468b6e522fdee811af911bb';
 const MAKER_PK = process.env.MAKER_PRIVATE_KEY || '';
+
+// Polymarket Exchange contracts on Polygon
+const CTF_EXCHANGE = '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E';
+const NEG_RISK_CTF_EXCHANGE = '0xC5d563A36AE78145C45a50134d48A1215220f80a';
 
 function buildAuthHeaders(method: string, path: string, body: string): Record<string, string> {
   if (!API_KEY || !SECRET) return {};
@@ -24,18 +29,29 @@ function buildAuthHeaders(method: string, path: string, body: string): Record<st
   };
 }
 
-// Sign order server-side with builder private key
-async function signOrder(orderParams: Record<string, unknown>): Promise<string> {
+// Fetch market metadata to determine if it's a NegRisk market
+async function fetchMarketNegRisk(tokenId: string): Promise<boolean> {
+  try {
+    const res = await fetch(`${GAMMA}/markets?clob_token_ids=${tokenId}`);
+    const data = await res.json();
+    const market = Array.isArray(data) ? data[0] : data;
+    return Boolean(market?.negRisk);
+  } catch (err) {
+    console.error('Gamma fetch failed:', err);
+    return false;
+  }
+}
+
+// Sign order server-side with builder private key. Uses NegRisk Exchange address for negRisk markets.
+async function signOrder(orderParams: Record<string, unknown>, negRisk: boolean): Promise<string> {
   const { ethers } = await import('ethers');
   const wallet = new ethers.Wallet(MAKER_PK);
-  
   const domain = {
     name: 'Polymarket CTF Exchange',
     version: '1',
     chainId: 137,
-    verifyingContract: '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E'
+    verifyingContract: negRisk ? NEG_RISK_CTF_EXCHANGE : CTF_EXCHANGE,
   };
-  
   const types = {
     Order: [
       { name: 'salt', type: 'uint256' },
@@ -50,9 +66,8 @@ async function signOrder(orderParams: Record<string, unknown>): Promise<string> 
       { name: 'feeRateBps', type: 'uint256' },
       { name: 'side', type: 'uint8' },
       { name: 'signatureType', type: 'uint8' },
-    ]
+    ],
   };
-  
   return await wallet._signTypedData(domain, types, orderParams);
 }
 
@@ -60,18 +75,18 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json();
     const { tokenId, side, makerAmount, takerAmount, orderType = 'FOK' } = body;
-    
     if (!tokenId || !makerAmount || !takerAmount) {
       return NextResponse.json({ error: 'tokenId, makerAmount, takerAmount required' }, { status: 400 });
     }
-
     if (!MAKER_PK) {
       return NextResponse.json({ error: 'Server signing not configured' }, { status: 500 });
     }
 
+    // FIX: detect whether this market is NegRisk, then sign against the correct Exchange contract
+    const negRisk = await fetchMarketNegRisk(tokenId.toString());
+
     const salt = Math.floor(Math.random() * 1e15);
     const sideNum = side === 'BUY' || side === 0 ? 0 : 1;
-
     const orderParams = {
       salt: salt.toString(),
       maker: MAKER_ADDRESS,
@@ -86,13 +101,10 @@ export async function POST(req: NextRequest) {
       side: sideNum,
       signatureType: 0,
     };
-
-    // Sign server-side with builder private key
-    const signature = await signOrder(orderParams);
-
+    const signature = await signOrder(orderParams, negRisk);
     const orderPayload = JSON.stringify({
       order: {
-        salt,                    // integer
+        salt,
         maker: MAKER_ADDRESS,
         signer: MAKER_ADDRESS,
         taker: '0x0000000000000000000000000000000000000000',
@@ -102,7 +114,7 @@ export async function POST(req: NextRequest) {
         expiration: '0',
         nonce: '0',
         feeRateBps: '50',
-        side: sideNum === 0 ? 'BUY' : 'SELL',  // string
+        side: sideNum === 0 ? 'BUY' : 'SELL',
         signatureType: 0,
         signature,
       },
@@ -111,24 +123,23 @@ export async function POST(req: NextRequest) {
       deferExec: false,
       builderAddress: BUILDER_ADDRESS,
     });
-
     const headers = buildAuthHeaders('POST', '/order', orderPayload);
     const res = await fetch(`${CLOB}/order`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...headers },
       body: orderPayload,
     });
-
     const text = await res.text();
     let data: Record<string, unknown>;
-    try { data = JSON.parse(text); } catch { data = { raw: text }; }
-
-    console.log('CLOB response:', res.status, text.slice(0, 300));
-
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = { raw: text };
+    }
+    console.log('CLOB response:', res.status, 'negRisk:', negRisk, text.slice(0, 300));
     if (!res.ok) {
       return NextResponse.json({ error: data.error || data.message || text.slice(0, 300) }, { status: 400 });
     }
-
     return NextResponse.json({ success: true, orderId: data.orderID || data.id, status: data.status });
   } catch (err) {
     console.error('Order error:', err);
